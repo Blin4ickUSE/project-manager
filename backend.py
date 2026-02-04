@@ -1,196 +1,268 @@
-# backend.py
 import os
+import json
 import secrets
 import shutil
 from datetime import datetime
 from typing import List, Optional
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text
 from sqlalchemy.orm import sessionmaker, declarative_base, relationship, Session
 from passlib.context import CryptContext
 from jose import JWTError, jwt
 
-# --- CONFIG ---
-SECRET_KEY = secrets.token_hex(32)
-ALGORITHM = "HS256"
+# --- КОНФИГУРАЦИЯ ---
 DATABASE_URL = "sqlite:///./data.db"
-UPLOAD_DIR = "uploads"
+UPLOAD_DIR = "./uploads"
+SECRET_KEY = secrets.token_hex(64)
+ALGORITHM = "HS256"
 
-# --- DATABASE SETUP ---
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# --- БАЗА ДАННЫХ ---
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# --- MODELS ---
-class User(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True)
-    hashed_password = Column(String)
-    is_admin = Column(Boolean, default=False)
+# --- МОДЕЛИ ---
+class Settings(Base):
+    __tablename__ = "settings"
+    key = Column(String, primary_key=True)
+    value = Column(String)
+
+class Admin(Base):
+    __tablename__ = "admins"
+    id = Column(Integer, primary_key=True)
+    username = Column(String, unique=True)
+    password_hash = Column(String)
+    avatar_url = Column(String, default="")
 
 class Project(Base):
     __tablename__ = "projects"
-    id = Column(String, primary_key=True, index=True) # Project ID (e.g., PRJ-123)
-    password = Column(String) # Simple access password for client
+    id = Column(String, primary_key=True) # ID проекта (PRJ-XXX)
+    password = Column(String) # Пароль клиента
     name = Column(String)
-    status = Column(String, default="In Progress")
-    deadline = Column(DateTime, nullable=True)
+    description = Column(Text, default="")
     price = Column(Integer, default=0)
-    paid = Column(Boolean, default=False)
-    progress = Column(Integer, default=0) # 0-100%
-    stages = Column(Text, default="[]") # JSON string of stages
-    is_completed = Column(Boolean, default=False)
+    paid_amount = Column(Integer, default=0)
+    deadline = Column(DateTime, nullable=True)
+    status = Column(String, default="New") # New, In Progress, Review, Completed
+    is_archived = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # JSON поля
+    stages = Column(Text, default='[{"title": "Start", "done": false}]') 
+    options = Column(Text, default='[]') # Доп опции
+    
+    messages = relationship("Message", back_populates="project", cascade="all, delete")
+    files = relationship("FileRecord", back_populates="project", cascade="all, delete")
 
 class Message(Base):
     __tablename__ = "messages"
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     project_id = Column(String, ForeignKey("projects.id"))
-    sender = Column(String) # "admin" or "client"
-    content = Column(Text)
+    sender = Column(String) # "admin" или "client"
+    text = Column(Text)
+    attachment_url = Column(String, nullable=True)
+    attachment_type = Column(String, nullable=True) # image, video, zip
     timestamp = Column(DateTime, default=datetime.utcnow)
-    file_path = Column(String, nullable=True)
-    file_type = Column(String, nullable=True)
+    read = Column(Boolean, default=False)
+    
+    project = relationship("Project", back_populates="messages")
+
+class FileRecord(Base):
+    __tablename__ = "files"
+    id = Column(Integer, primary_key=True)
+    project_id = Column(String, ForeignKey("projects.id"))
+    filename = Column(String)
+    filepath = Column(String)
+    uploaded_by = Column(String)
+    uploaded_at = Column(DateTime, default=datetime.utcnow)
+    
+    project = relationship("Project", back_populates="files")
 
 class Todo(Base):
     __tablename__ = "todos"
-    id = Column(Integer, primary_key=True, index=True)
-    task = Column(String)
-    done = Column(Boolean, default=False)
+    id = Column(Integer, primary_key=True)
+    text = Column(String)
+    is_done = Column(Boolean, default=False)
+    priority = Column(String, default="low") # low, high
 
 Base.metadata.create_all(bind=engine)
 
-# --- SECURITY ---
+# --- BEZOPASNOST ---
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = None # Simplified for this demo
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 def get_db():
     db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+    try: yield db
+    finally: db.close()
 
-# --- API ---
+def create_token(data: dict):
+    return jwt.encode(data, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# --- FASTAPI APP ---
 app = FastAPI()
 
+# Разрешаем CORS для фронта на 7443
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"], # В продакшене лучше указать конкретный домен
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.mount("/files", StaticFiles(directory=UPLOAD_DIR), name="files")
 
-# --- Pydantic Schemas ---
-class ProjectCreate(BaseModel):
-    name: str
-    price: int
-    deadline: Optional[datetime] = None
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
-class LoginRequest(BaseModel):
-    username: str
-    password: str
+# --- AUTH ENDPOINTS ---
 
-# --- ENDPOINTS ---
-
-@app.post("/api/admin/login")
-def admin_login(creds: LoginRequest, db: Session = Depends(get_db)):
-    # Default admin if not exists
-    admin = db.query(User).filter(User.username == "admin").first()
-    if not admin:
-        admin = User(username="admin", hashed_password=pwd_context.hash("superadmin123"), is_admin=True)
-        db.add(admin)
+@app.post("/api/auth/admin")
+def admin_login(form: dict = Body(...), db: Session = Depends(get_db)):
+    # Создаем админа, если нет (Первый запуск)
+    if not db.query(Admin).first():
+        hashed = pwd_context.hash("admin123") # Default password
+        db.add(Admin(username="admin", password_hash=hashed))
         db.commit()
     
-    user = db.query(User).filter(User.username == creds.username).first()
-    if not user or not pwd_context.verify(creds.password, user.hashed_password) or not user.is_admin:
-        raise HTTPException(status_code=401, detail="Invalid admin credentials")
-    return {"token": "admin_access_granted", "role": "admin"}
+    admin = db.query(Admin).filter(Admin.username == form.get("username")).first()
+    if not admin or not pwd_context.verify(form.get("password"), admin.password_hash):
+        raise HTTPException(401, "Неверный логин или пароль")
+    
+    return {"token": create_token({"sub": "admin", "role": "admin"}), "role": "admin"}
 
-@app.post("/api/client/login")
-def client_login(creds: LoginRequest, db: Session = Depends(get_db)):
-    project = db.query(Project).filter(Project.id == creds.username).first() # username is project_id
-    if not project or project.password != creds.password:
-        raise HTTPException(status_code=401, detail="Invalid project credentials")
-    return {"token": project.id, "role": "client"}
+@app.post("/api/auth/client")
+def client_login(form: dict = Body(...), db: Session = Depends(get_db)):
+    project = db.query(Project).filter(Project.id == form.get("project_id")).first()
+    if not project or project.password != form.get("password"):
+        raise HTTPException(401, "Неверный ID проекта или пароль")
+    
+    return {"token": create_token({"sub": project.id, "role": "client"}), "role": "client", "project_id": project.id}
+
+# --- ADMIN ENDPOINTS ---
+
+@app.get("/api/admin/dashboard")
+def get_dashboard(user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if user['role'] != 'admin': raise HTTPException(403)
+    
+    projects = db.query(Project).all()
+    todos = db.query(Todo).all()
+    total_money = sum(p.price for p in projects)
+    return {
+        "projects": projects,
+        "todos": todos,
+        "stats": {
+            "total_projects": len(projects),
+            "active_projects": len([p for p in projects if p.status != "Completed"]),
+            "total_money": total_money
+        }
+    }
 
 @app.post("/api/projects")
-def create_project(data: ProjectCreate, db: Session = Depends(get_db)):
-    prj_id = "PRJ-" + secrets.token_hex(3).upper()
-    prj_pass = secrets.token_urlsafe(8)
-    new_project = Project(
-        id=prj_id,
-        password=prj_pass,
-        name=data.name,
-        price=data.price,
-        deadline=data.deadline,
-        stages='["Start", "Design", "Development", "Testing", "Release"]'
+def create_project(data: dict = Body(...), user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if user['role'] != 'admin': raise HTTPException(403)
+    
+    pid = f"PRJ-{secrets.token_hex(3).upper()}"
+    ppass = secrets.token_urlsafe(6)
+    
+    new_proj = Project(
+        id=pid,
+        password=ppass,
+        name=data['name'],
+        price=int(data.get('price', 0)),
+        deadline=datetime.fromisoformat(data['deadline']) if data.get('deadline') else None,
+        stages=json.dumps([{"title": "Создание", "done": False}, {"title": "Разработка", "done": False}, {"title": "Финал", "done": False}])
     )
-    db.add(new_project)
+    db.add(new_proj)
     db.commit()
-    return {"id": prj_id, "password": prj_pass}
+    return {"id": pid, "password": ppass}
 
-@app.get("/api/projects")
-def get_projects(db: Session = Depends(get_db)):
-    return db.query(Project).all()
-
-@app.get("/api/projects/{project_id}")
-def get_project_details(project_id: str, db: Session = Depends(get_db)):
-    project = db.query(Project).filter(Project.id == project_id).first()
-    messages = db.query(Message).filter(Message.project_id == project_id).all()
-    if not project:
-        raise HTTPException(404)
-    return {"project": project, "messages": messages}
-
-@app.post("/api/projects/{project_id}/update")
-def update_project(project_id: str, data: dict, db: Session = Depends(get_db)):
-    project = db.query(Project).filter(Project.id == project_id).first()
-    if "progress" in data: project.progress = data["progress"]
-    if "status" in data: project.status = data["status"]
-    if "paid" in data: project.paid = data["paid"]
+@app.put("/api/projects/{pid}")
+def update_project(pid: str, data: dict = Body(...), user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if user['role'] != 'admin': raise HTTPException(403)
+    proj = db.query(Project).filter(Project.id == pid).first()
+    
+    if "stages" in data: proj.stages = json.dumps(data['stages'])
+    if "status" in data: proj.status = data['status']
+    if "price" in data: proj.price = data['price']
+    if "paid_amount" in data: proj.paid_amount = data['paid_amount']
+    
     db.commit()
     return {"status": "ok"}
 
-@app.post("/api/upload")
-async def upload_file(file: UploadFile = File(...)):
-    file_location = os.path.join(UPLOAD_DIR, file.filename)
-    with open(file_location, "wb+") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    return {"filename": file.filename, "url": f"/files/{file.filename}", "type": file.content_type}
+@app.post("/api/todos")
+def add_todo(data: dict = Body(...), user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if user['role'] != 'admin': raise HTTPException(403)
+    db.add(Todo(text=data['text'], priority=data.get('priority', 'low')))
+    db.commit()
+    return {"status": "ok"}
 
-@app.post("/api/chat")
-def send_message(data: dict, db: Session = Depends(get_db)):
+@app.delete("/api/todos/{tid}")
+def delete_todo(tid: int, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    if user['role'] != 'admin': raise HTTPException(403)
+    db.query(Todo).filter(Todo.id == tid).delete()
+    db.commit()
+    return {"status": "ok"}
+
+# --- SHARED/CLIENT ENDPOINTS ---
+
+@app.get("/api/project/{pid}")
+def get_project_details(pid: str, user=Depends(get_current_user), db: Session = Depends(get_db)):
+    # Access check
+    if user['role'] != 'admin' and user['sub'] != pid:
+        raise HTTPException(403)
+        
+    proj = db.query(Project).filter(Project.id == pid).first()
+    msgs = db.query(Message).filter(Message.project_id == pid).order_by(Message.timestamp).all()
+    files = db.query(FileRecord).filter(FileRecord.project_id == pid).all()
+    
+    return {
+        "details": proj,
+        "messages": msgs,
+        "files": files,
+        "stages": json.loads(proj.stages),
+        "options": json.loads(proj.options)
+    }
+
+@app.post("/api/chat/{pid}")
+def send_message(pid: str, data: dict = Body(...), user=Depends(get_current_user), db: Session = Depends(get_db)):
+    sender = "admin" if user['role'] == 'admin' else "client"
     msg = Message(
-        project_id=data['project_id'],
-        sender=data['sender'],
-        content=data.get('content', ''),
-        file_path=data.get('file_path'),
-        file_type=data.get('file_type')
+        project_id=pid,
+        sender=sender,
+        text=data.get("text", ""),
+        attachment_url=data.get("attachment_url"),
+        attachment_type=data.get("attachment_type")
     )
     db.add(msg)
     db.commit()
-    return {"status": "sent"}
+    return {"status": "sent", "msg": msg}
 
-# --- ADMIN TODO ---
-@app.get("/api/todos")
-def get_todos(db: Session = Depends(get_db)):
-    return db.query(Todo).all()
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...), user=Depends(get_current_user), db: Session = Depends(get_db)):
+    # Определяем Project ID
+    pid = user['sub']
+    if user['role'] == 'admin':
+        # Admin должен передать project_id в заголовках или форме, для простоты берем из имени файла или отдельного поля,
+        # но здесь упростим: файл просто грузится, привязка идет при отправке сообщения
+        pass
 
-@app.post("/api/todos")
-def add_todo(task: str, db: Session = Depends(get_db)):
-    db.add(Todo(task=task))
-    db.commit()
-    return {"status": "ok"}
-
-@app.delete("/api/todos/{id}")
-def delete_todo(id: int, db: Session = Depends(get_db)):
-    db.query(Todo).filter(Todo.id == id).delete()
-    db.commit()
-    return {"status": "ok"}
+    fname = f"{secrets.token_hex(4)}_{file.filename}"
+    fpath = os.path.join(UPLOAD_DIR, fname)
+    
+    with open(fpath, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    # Возвращаем URL
+    return {"url": f"/uploads/{fname}", "filename": file.filename, "type": file.content_type}
